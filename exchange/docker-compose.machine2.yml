@@ -1,0 +1,113 @@
+# Machine 2 — banks 3, 4, 5
+# Set MACHINE1_IP to the LAN IP of machine 1 before running.
+# Example: MACHINE1_IP=192.168.1.10 docker compose -f docker-compose.machine2.yml up
+version: "3.9"
+
+networks:
+  exchange_net:
+    driver: bridge
+
+x-bank-common: &bank-common
+  build:
+    context: .
+    dockerfile: docker/bank.Dockerfile
+  networks:
+    - exchange_net
+  restart: on-failure
+
+x-pg-common: &pg-common
+  build:
+    context: .
+    dockerfile: docker/postgres.Dockerfile
+  networks:
+    - exchange_net
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U exchange"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+services:
+  pg_bank_3:
+    <<: *pg-common
+    environment:
+      POSTGRES_DB: exchange_bank_3
+    volumes:
+      - pg_bank_3_data:/var/lib/postgresql/data
+
+  pg_bank_4:
+    <<: *pg-common
+    environment:
+      POSTGRES_DB: exchange_bank_4
+    volumes:
+      - pg_bank_4_data:/var/lib/postgresql/data
+
+  pg_bank_5:
+    <<: *pg-common
+    environment:
+      POSTGRES_DB: exchange_bank_5
+    volumes:
+      - pg_bank_5_data:/var/lib/postgresql/data
+
+  bank_3:
+    <<: *bank-common
+    depends_on:
+      pg_bank_3:
+        condition: service_healthy
+    environment:
+      BANK_ID: bank_3
+      BANK_HOST: "0.0.0.0"
+      BANK_PORT: "9003"
+      DB_URL: "postgresql://exchange:exchange@pg_bank_3/exchange_bank_3"
+      KEYS_DIR: /app/keys
+      PEER_0: "bank_0:${MACHINE1_IP}:9000"
+      PEER_1: "bank_1:${MACHINE1_IP}:9001"
+      PEER_2: "bank_2:${MACHINE1_IP}:9002"
+      PEER_3: "bank_4:bank_4:9004"
+      PEER_4: "bank_5:bank_5:9005"
+    ports:
+      - "9003:9003"
+
+  bank_4:
+    <<: *bank-common
+    depends_on:
+      pg_bank_4:
+        condition: service_healthy
+    environment:
+      BANK_ID: bank_4
+      BANK_HOST: "0.0.0.0"
+      BANK_PORT: "9004"
+      DB_URL: "postgresql://exchange:exchange@pg_bank_4/exchange_bank_4"
+      KEYS_DIR: /app/keys
+      PEER_0: "bank_0:${MACHINE1_IP}:9000"
+      PEER_1: "bank_1:${MACHINE1_IP}:9001"
+      PEER_2: "bank_2:${MACHINE1_IP}:9002"
+      PEER_3: "bank_3:bank_3:9003"
+      PEER_4: "bank_5:bank_5:9005"
+    ports:
+      - "9004:9004"
+
+  bank_5:
+    <<: *bank-common
+    depends_on:
+      pg_bank_5:
+        condition: service_healthy
+    environment:
+      BANK_ID: bank_5
+      BANK_HOST: "0.0.0.0"
+      BANK_PORT: "9005"
+      DB_URL: "postgresql://exchange:exchange@pg_bank_5/exchange_bank_5"
+      KEYS_DIR: /app/keys
+      PEER_0: "bank_0:${MACHINE1_IP}:9000"
+      PEER_1: "bank_1:${MACHINE1_IP}:9001"
+      PEER_2: "bank_2:${MACHINE1_IP}:9002"
+      PEER_3: "bank_3:bank_3:9003"
+      PEER_4: "bank_4:bank_4:9004"
+    ports:
+      - "9005:9005"
+
+volumes:
+  pg_bank_3_data:
+  pg_bank_4_data:
+  pg_bank_5_data:
