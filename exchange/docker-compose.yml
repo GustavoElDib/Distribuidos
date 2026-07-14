@@ -9,6 +9,18 @@ x-bank-common: &bank-common
   networks:
     - exchange_net
   restart: on-failure
+  # Keys are mounted (not only baked into the image) so every node — and every
+  # machine — uses the same keypairs without rebuilding the image.
+  volumes:
+    - ./keys:/app/keys:ro
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('API_PORT','8000')+'/api/status', timeout=3)"
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
 
 x-pg-common: &pg-common
   build:
@@ -18,7 +30,7 @@ x-pg-common: &pg-common
     - exchange_net
   restart: unless-stopped
   healthcheck:
-    test: ["CMD-SHELL", "pg_isready -U exchange"]
+    test: ["CMD-SHELL", "pg_isready -U exchange -d $$POSTGRES_DB"]
     interval: 5s
     timeout: 3s
     retries: 10

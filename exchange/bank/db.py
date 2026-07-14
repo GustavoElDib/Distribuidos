@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import date, datetime, timezone
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 
@@ -96,7 +98,7 @@ class Database:
         self._pool: Optional[asyncpg.Pool] = None
 
     async def initialize(self) -> None:
-        self._pool = await asyncpg.create_pool(self._db_url, min_size=2, max_size=10)
+        self._pool = await self._create_pool_with_retry()
         async with self._pool.acquire() as conn:
             await conn.execute(_SCHEMA)
             # Migrate tables created before the 'partial' fill status existed.
@@ -110,6 +112,51 @@ class Database:
                 "CHECK (status IN ('pending', 'matched', 'partial', 'expired', 'cancelled'))"
             )
         logger.info("database initialized")
+
+    async def _create_pool_with_retry(self) -> asyncpg.Pool:
+        """Connect to Postgres, surviving two production failure modes:
+
+        - the Postgres container is still starting when the bank comes up
+          (connection refused / "the database system is starting up");
+        - the target database does not exist because the Postgres data volume
+          was initialised by an older compose file, before POSTGRES_DB was set
+          (initdb only runs on an EMPTY volume, so env changes are ignored) —
+          in that case we create the database ourselves and retry.
+        """
+        delay = 1.0
+        last_exc: Optional[Exception] = None
+        for _ in range(12):
+            try:
+                return await asyncpg.create_pool(
+                    self._db_url, min_size=2, max_size=10
+                )
+            except asyncpg.InvalidCatalogNameError:
+                await self._create_missing_database()
+            except (OSError, TimeoutError, asyncpg.CannotConnectNowError) as exc:
+                last_exc = exc
+                logger.warning(
+                    "postgres not ready (%s); retrying in %.0fs", exc, delay
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 10.0)
+        raise RuntimeError(
+            f"could not connect to database at {self._db_url}"
+        ) from last_exc
+
+    async def _create_missing_database(self) -> None:
+        """Create the target database via the maintenance db 'postgres'."""
+        parts = urlsplit(self._db_url)
+        dbname = parts.path.lstrip("/")
+        admin_url = urlunsplit(parts._replace(path="/postgres"))
+        logger.warning('database "%s" does not exist — creating it', dbname)
+        conn = await asyncpg.connect(admin_url)
+        try:
+            safe_name = dbname.replace('"', '""')
+            await conn.execute(f'CREATE DATABASE "{safe_name}"')
+        except asyncpg.DuplicateDatabaseError:
+            pass  # another replica created it between our check and now
+        finally:
+            await conn.close()
 
     async def close(self) -> None:
         if self._pool:

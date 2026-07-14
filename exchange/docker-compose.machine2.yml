@@ -12,6 +12,18 @@ x-bank-common: &bank-common
   networks:
     - exchange_net
   restart: on-failure
+  # Keys are mounted so both machines share the same keypairs — copy the
+  # keys/ directory from machine 1 before starting (see DEPLOYMENT.md).
+  volumes:
+    - ./keys:/app/keys:ro
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('API_PORT','8000')+'/api/status', timeout=3)"
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
 
 x-pg-common: &pg-common
   build:
@@ -21,7 +33,7 @@ x-pg-common: &pg-common
     - exchange_net
   restart: unless-stopped
   healthcheck:
-    test: ["CMD-SHELL", "pg_isready -U exchange"]
+    test: ["CMD-SHELL", "pg_isready -U exchange -d $$POSTGRES_DB"]
     interval: 5s
     timeout: 3s
     retries: 10
@@ -57,6 +69,7 @@ services:
       BANK_ID: bank_3
       BANK_HOST: "0.0.0.0"
       BANK_PORT: "9003"
+      API_PORT: "8003"
       DB_URL: "postgresql://exchange:exchange@pg_bank_3/exchange_bank_3"
       KEYS_DIR: /app/keys
       PEER_0: "bank_0:${MACHINE1_IP}:9000"
@@ -66,6 +79,7 @@ services:
       PEER_4: "bank_5:bank_5:9005"
     ports:
       - "9003:9003"
+      - "8003:8003"
 
   bank_4:
     <<: *bank-common
@@ -76,6 +90,7 @@ services:
       BANK_ID: bank_4
       BANK_HOST: "0.0.0.0"
       BANK_PORT: "9004"
+      API_PORT: "8004"
       DB_URL: "postgresql://exchange:exchange@pg_bank_4/exchange_bank_4"
       KEYS_DIR: /app/keys
       PEER_0: "bank_0:${MACHINE1_IP}:9000"
@@ -85,6 +100,7 @@ services:
       PEER_4: "bank_5:bank_5:9005"
     ports:
       - "9004:9004"
+      - "8004:8004"
 
   bank_5:
     <<: *bank-common
@@ -95,6 +111,7 @@ services:
       BANK_ID: bank_5
       BANK_HOST: "0.0.0.0"
       BANK_PORT: "9005"
+      API_PORT: "8005"
       DB_URL: "postgresql://exchange:exchange@pg_bank_5/exchange_bank_5"
       KEYS_DIR: /app/keys
       PEER_0: "bank_0:${MACHINE1_IP}:9000"
@@ -104,6 +121,7 @@ services:
       PEER_4: "bank_4:bank_4:9004"
     ports:
       - "9005:9005"
+      - "8005:8005"
 
 volumes:
   pg_bank_3_data:

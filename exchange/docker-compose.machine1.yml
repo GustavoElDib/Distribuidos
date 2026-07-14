@@ -12,6 +12,18 @@ x-bank-common: &bank-common
   networks:
     - exchange_net
   restart: on-failure
+  # Keys are mounted so both machines share the same keypairs — copy the
+  # keys/ directory to machine 2 before starting (see DEPLOYMENT.md).
+  volumes:
+    - ./keys:/app/keys:ro
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('API_PORT','8000')+'/api/status', timeout=3)"
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
 
 x-pg-common: &pg-common
   build:
@@ -21,7 +33,7 @@ x-pg-common: &pg-common
     - exchange_net
   restart: unless-stopped
   healthcheck:
-    test: ["CMD-SHELL", "pg_isready -U exchange"]
+    test: ["CMD-SHELL", "pg_isready -U exchange -d $$POSTGRES_DB"]
     interval: 5s
     timeout: 3s
     retries: 10
@@ -57,6 +69,7 @@ services:
       BANK_ID: bank_0
       BANK_HOST: "0.0.0.0"
       BANK_PORT: "9000"
+      API_PORT: "8000"
       DB_URL: "postgresql://exchange:exchange@pg_bank_0/exchange_bank_0"
       KEYS_DIR: /app/keys
       PEER_0: "bank_1:bank_1:9001"
@@ -66,6 +79,7 @@ services:
       PEER_4: "bank_5:${MACHINE2_IP}:9005"
     ports:
       - "9000:9000"
+      - "8000:8000"
 
   bank_1:
     <<: *bank-common
@@ -76,6 +90,7 @@ services:
       BANK_ID: bank_1
       BANK_HOST: "0.0.0.0"
       BANK_PORT: "9001"
+      API_PORT: "8001"
       DB_URL: "postgresql://exchange:exchange@pg_bank_1/exchange_bank_1"
       KEYS_DIR: /app/keys
       PEER_0: "bank_0:bank_0:9000"
@@ -85,6 +100,7 @@ services:
       PEER_4: "bank_5:${MACHINE2_IP}:9005"
     ports:
       - "9001:9001"
+      - "8001:8001"
 
   bank_2:
     <<: *bank-common
@@ -95,6 +111,7 @@ services:
       BANK_ID: bank_2
       BANK_HOST: "0.0.0.0"
       BANK_PORT: "9002"
+      API_PORT: "8002"
       DB_URL: "postgresql://exchange:exchange@pg_bank_2/exchange_bank_2"
       KEYS_DIR: /app/keys
       PEER_0: "bank_0:bank_0:9000"
@@ -104,6 +121,7 @@ services:
       PEER_4: "bank_5:${MACHINE2_IP}:9005"
     ports:
       - "9002:9002"
+      - "8002:8002"
 
 volumes:
   pg_bank_0_data:

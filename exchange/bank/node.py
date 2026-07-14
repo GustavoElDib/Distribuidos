@@ -89,6 +89,7 @@ class BankNode:
         self.consensus_manager.initialize_bank_ids(all_bank_ids)
 
         await self.db.initialize()
+        await self._restore_chain_from_db()
 
         cfg = self.config.this_bank
         self._server = await asyncio.start_server(
@@ -106,6 +107,33 @@ class BankNode:
             asyncio.create_task(self._heartbeat_loop(), name="heartbeat"),
             asyncio.create_task(self._auction_timer_loop(), name="auction_timer"),
         ]
+
+    async def _restore_chain_from_db(self) -> None:
+        """Reload persisted blocks into the in-memory chain.
+
+        The blockchain object starts with only the genesis block. Without this
+        step every process restart (docker restart, crash + on-failure, Ctrl+C
+        no run_local) silently reset the chain to genesis even though all the
+        blocks were safely stored in the database.
+        """
+        stored_blocks = await self.db.get_blocks_from(1)  # 0 is the genesis
+        restored = 0
+        for block in stored_blocks:
+            try:
+                self.blockchain.append(block)
+                restored += 1
+            except ValueError as exc:
+                logger.error(
+                    "stored block %d failed validation (%s) — ignoring it and "
+                    "any later blocks; the node will catch up via chain sync",
+                    block.index, exc,
+                )
+                break
+        if restored:
+            logger.info(
+                "blockchain restored from database: %d block(s), chain length=%d",
+                restored, len(self.blockchain),
+            )
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -318,6 +346,20 @@ class BankNode:
             self._record_block_produced(len(block.orders))
         except ValueError as exc:
             logger.error("block commit rejected: %s", exc)
+            if block.index > len(self.blockchain):
+                # We are behind the network (missed one or more commits while
+                # down) — ask the peers for the missing blocks.
+                await self._request_chain_sync()
+
+    async def _request_chain_sync(self) -> None:
+        """Ask every connected peer for blocks we don't have yet."""
+        last_index = len(self.blockchain) - 1
+        sync_req = build_message(
+            MessageType.CHAIN_SYNC_REQUEST,
+            self.bank_id,
+            ChainSyncRequestPayload(from_index=last_index),
+        )
+        await self.broadcast_to_all(sync_req)
 
     def _handle_block_rejected(self, payload: BlockRejectedPayload) -> None:
         """A leader announced its block was rejected — rotate to the new leader."""
@@ -413,13 +455,28 @@ class BankNode:
     # ------------------------------------------------------------------
 
     async def _peer_connect_loop(self) -> None:
+        warned: set[str] = set()
         while True:
+            # drop finished reader tasks so the list doesn't grow forever
+            self._tasks = [t for t in self._tasks if not t.done()]
             for peer in self.config.peers:
                 if peer.bank_id not in self.peer_writers:
                     try:
-                        _, writer = await asyncio.open_connection(peer.host, peer.port)
+                        reader, writer = await asyncio.open_connection(
+                            peer.host, peer.port
+                        )
                         self.peer_writers[peer.bank_id] = writer
+                        warned.discard(peer.bank_id)
                         logger.info("connected to peer %s", peer.bank_id)
+                        # Read replies that arrive on this outbound socket —
+                        # the peer answers CHAIN_SYNC_REQUEST on the same
+                        # connection, so without a read loop here the response
+                        # was silently discarded and a restarted node never
+                        # caught up with the rest of the network.
+                        self._tasks.append(asyncio.create_task(
+                            self._read_peer_connection(peer.bank_id, reader, writer),
+                            name=f"peer_read_{peer.bank_id}",
+                        ))
                         # request chain sync
                         last_index = len(self.blockchain) - 1
                         sync_req = build_message(
@@ -430,8 +487,42 @@ class BankNode:
                         writer.write(sync_req.encode())
                         await writer.drain()
                     except Exception as exc:
-                        logger.debug("could not connect to %s: %s", peer.bank_id, exc)
+                        # warn once per outage, then stay quiet until it heals
+                        log = logger.debug if peer.bank_id in warned else logger.warning
+                        warned.add(peer.bank_id)
+                        log(
+                            "could not connect to %s at %s:%d: %s",
+                            peer.bank_id, peer.host, peer.port, exc,
+                        )
             await asyncio.sleep(5)
+
+    async def _read_peer_connection(
+        self, peer_id: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Read loop for an outbound peer connection."""
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    logger.warning("peer %s closed the connection", peer_id)
+                    break
+                try:
+                    msg = Message.from_json(line.decode("utf-8").strip())
+                    await self._handle_message(msg, writer)
+                except Exception as exc:
+                    logger.warning("message from %s failed: %s", peer_id, exc)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("link to %s dropped: %s", peer_id, exc)
+        finally:
+            # unregister so _peer_connect_loop reconnects on its next tick
+            if self.peer_writers.get(peer_id) is writer:
+                self.peer_writers.pop(peer_id, None)
+            try:
+                writer.close()
+            except Exception:
+                pass
 
     async def _heartbeat_loop(self) -> None:
         while True:
