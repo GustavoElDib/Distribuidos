@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from .auction import run_call_auction
-from .blockchain import Block, Order, Trade, EodSnapshot
+from .blockchain import Block, EodSnapshot, Trade
+from .crypto import verify_block
 from .messages import (
     MessageType,
     BlockCandidatePayload,
@@ -35,12 +36,68 @@ class ConsensusManager:
         self._node = node
         self._vote_futures: dict[str, asyncio.Future[BlockVotePayload]] = {}
         self._sorted_bank_ids: list[str] = []
+        self._byzantine_nodes: set[str] = set()
+
+        # Consensus round for the current block height. Incremented (rotating
+        # the leader) whenever a proposed block is rejected by manager votes;
+        # reset to 0 once a block is committed.
+        self._round: int = 0
+
+        # Live vote tracking for dashboard visibility
+        self._vote_state: dict[str, str] = {}   # peer_id -> "pending"/"accepted"/"rejected"/"timeout"/"byzantine"
+        self._voting_block_index: int | None = None
+        self._voting_since: float | None = None  # asyncio loop time when round started
+        self._last_vote_result: dict | None = None  # final result of last round
 
     def initialize_bank_ids(self, all_bank_ids: list[str]) -> None:
         self._sorted_bank_ids = sorted(all_bank_ids)
 
+    @property
+    def byzantine_nodes(self) -> set[str]:
+        return self._byzantine_nodes
+
+    def get_vote_status(self) -> dict:
+        """Return current or last voting round status for API/dashboard."""
+        now = asyncio.get_event_loop().time()
+        elapsed = round(now - self._voting_since, 1) if self._voting_since else None
+        return {
+            "active": self._voting_block_index is not None,
+            "block_index": self._voting_block_index,
+            "elapsed_seconds": elapsed,
+            "votes": dict(self._vote_state),
+            "last_result": self._last_vote_result,
+        }
+
+    @property
+    def bft_f(self) -> int:
+        """Maximum number of Byzantine faults tolerable (floor((n-1)/3))."""
+        n = len(self._sorted_bank_ids)
+        return (n - 1) // 3
+
+    @property
+    def bft_quorum(self) -> int:
+        """Minimum accept votes required for BFT consensus (2f+1)."""
+        return 2 * self.bft_f + 1
+
     def get_current_leader(self, block_index: int) -> str:
-        return self._sorted_bank_ids[block_index % len(self._sorted_bank_ids)]
+        n = len(self._sorted_bank_ids)
+        return self._sorted_bank_ids[(block_index + self._round) % n]
+
+    @property
+    def current_round(self) -> int:
+        return self._round
+
+    def advance_round(self) -> int:
+        """Rotate leadership to the next bank after a rejected block."""
+        self._round += 1
+        return self._round
+
+    def set_round(self, value: int) -> None:
+        """Adopt the round announced by the leader (keeps nodes in sync)."""
+        self._round = value
+
+    def reset_round(self) -> None:
+        self._round = 0
 
     async def produce_block(self, sync_result, block_index: int) -> Block:  # type: ignore[type-arg]
         from .sync import SyncResult
@@ -105,7 +162,6 @@ class ConsensusManager:
             logger.warning("verify: merkle_root mismatch on block %d", candidate.index)
             return False
 
-        from .crypto import verify_block, load_peer_keys
         peer_keys = self._node.peer_keys
         producer_key = peer_keys.get(candidate.producer_id)
         if producer_key is None:
@@ -152,6 +208,12 @@ class ConsensusManager:
         peer_ids = list(self._node.peer_writers.keys())
         loop = asyncio.get_event_loop()
 
+        # Initialize live vote state (leader counts as implicit accept)
+        self._voting_block_index = candidate.index
+        self._voting_since = loop.time()
+        self._vote_state = {pid: "pending" for pid in peer_ids}
+        self._vote_state[cfg.this_bank.bank_id] = "accepted"  # leader's own vote
+
         for peer_id in peer_ids:
             self._vote_futures[peer_id] = loop.create_future()
 
@@ -167,23 +229,51 @@ class ConsensusManager:
             return_exceptions=True,
         )
 
-        accept = 0
+        # Leader counts its own implicit accept vote
+        accept = 1
         reject = 0
-        responding = 0
-        for result in results:
+        responding = 1
+
+        for peer_id, result in zip(peer_ids, results):
+            if peer_id in self._byzantine_nodes:
+                logger.warning("vote: ignoring known Byzantine node %s", peer_id)
+                self._vote_state[peer_id] = "byzantine"
+                continue
             if isinstance(result, Exception):
-                logger.warning("vote: peer timed out")
+                logger.warning("vote: peer %s timed out", peer_id)
+                self._vote_state[peer_id] = "timeout"
                 continue
             responding += 1
             if result.accepted:
                 accept += 1
+                self._vote_state[peer_id] = "accepted"
             else:
                 reject += 1
+                self._vote_state[peer_id] = "rejected"
 
         self._vote_futures.clear()
 
-        quorum = (responding // 2) + 1
+        # BFT quorum: require 2f+1 accepts (f = floor((n-1)/3))
+        quorum = self.bft_quorum
         accepted = accept >= quorum
+
+        logger.info(
+            "voting round block %d: accept=%d reject=%d quorum=%d bft_f=%d -> %s",
+            candidate.index, accept, reject, quorum, self.bft_f,
+            "ACCEPTED" if accepted else "REJECTED",
+        )
+
+        self._last_vote_result = {
+            "block_index": candidate.index,
+            "accepted": accepted,
+            "accept_count": accept,
+            "reject_count": reject,
+            "quorum": quorum,
+            "votes": dict(self._vote_state),
+        }
+        # Clear active round (round is done)
+        self._voting_block_index = None
+        self._voting_since = None
 
         return VoteResult(
             accepted=accepted,
@@ -199,15 +289,51 @@ class ConsensusManager:
         return await asyncio.wait_for(fut, timeout=timeout)
 
     def handle_vote(self, sender_id: str, payload: BlockVotePayload) -> None:
+        # Validate vote signature for Byzantine detection
+        if payload.signature:
+            peer_key = self._node.peer_keys.get(sender_id)
+            if peer_key is None:
+                logger.warning("byzantine: vote from unknown peer %s", sender_id)
+                self._byzantine_nodes.add(sender_id)
+                return
+            vote_data = f"{payload.block_index}:{payload.block_hash}:{payload.accepted}"
+            if not verify_block(peer_key, vote_data, payload.signature):
+                logger.warning(
+                    "byzantine: invalid vote signature from %s on block %d",
+                    sender_id, payload.block_index,
+                )
+                self._byzantine_nodes.add(sender_id)
+                return
+        else:
+            logger.warning("vote from %s missing signature (block %d)", sender_id, payload.block_index)
+
         fut = self._vote_futures.get(sender_id)
-        if fut is not None and not fut.done():
-            fut.set_result(payload)
+        if fut is None:
+            return
+        if fut.done():
+            # Detect conflicting votes from same node (equivocation)
+            try:
+                prev = fut.result()
+                if prev.accepted != payload.accepted:
+                    logger.warning(
+                        "byzantine: equivocating vote from %s on block %d",
+                        sender_id, payload.block_index,
+                    )
+                    self._byzantine_nodes.add(sender_id)
+                    self._vote_state[sender_id] = "byzantine"
+            except Exception:
+                pass
+            return
+        # Update live vote state immediately so dashboard can show it
+        self._vote_state[sender_id] = "accepted" if payload.accepted else "rejected"
+        fut.set_result(payload)
 
     async def commit_block(self, block: Block) -> None:
         self._node.blockchain.append(block)
         await self._node.db.persist_block(block)
         await self._node.gossip_manager.clear_pending_orders()
-        self._node.gossip_manager.disable_full_broadcast()
+        # New block height starts a fresh round → normal leader rotation resumes.
+        self.reset_round()
         logger.info(
             "committed block %d trades=%d is_eod=%s",
             block.index, len(block.trades), block.is_eod,

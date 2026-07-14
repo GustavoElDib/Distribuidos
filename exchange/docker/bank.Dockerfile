@@ -11,4 +11,6 @@ COPY keys/ ./keys/
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "-m", "bank.node"]
+EXPOSE 9000 8000
+
+CMD ["python", "-m", "bank"]

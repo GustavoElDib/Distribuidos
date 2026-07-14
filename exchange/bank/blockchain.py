@@ -161,7 +161,7 @@ class BlockChain:
     def _init_genesis(self) -> None:
         genesis = Block(
             index=0,
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp="1970-01-01T00:00:00+00:00",  # fixed so all nodes produce identical hash
             previous_hash="0" * 64,
             producer_id="genesis",
             orders=[],

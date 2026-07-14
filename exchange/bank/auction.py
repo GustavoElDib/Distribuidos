@@ -93,14 +93,21 @@ def _auction_single_stock(
     eligible_buys = [o for o in buys_sorted if o.limit_price >= best_price]
     eligible_sells = [o for o in sells_sorted if o.limit_price <= best_price]
 
-    trades, matched_buy_ids, matched_sell_ids = _match_pro_rata(
+    trades, buy_rem, sell_rem = _match_pro_rata(
         eligible_buys, eligible_sells, best_price, block_index
     )
 
-    unmatched = [
-        o for o in orders
-        if o.order_id not in matched_buy_ids and o.order_id not in matched_sell_ids
-    ]
+    # If self-trade exclusion left no executable trades, there is no real
+    # clearing price — return None so no phantom price is recorded.
+    if not trades:
+        return [], None, list(orders)
+
+    # An order is unmatched (fully or partially) whenever it still has
+    # quantity left over after pro-rata allocation — not merely "didn't
+    # appear in any trade". A buy for 20 filled for only 10 must still be
+    # reported here; the leftover 10 don't roll over to a future auction.
+    remaining = {**buy_rem, **sell_rem}
+    unmatched = [o for o in orders if remaining.get(o.order_id, o.quantity) > 0]
 
     return trades, best_price, unmatched
 
@@ -112,9 +119,11 @@ def _tiebreak(
     all_prices: list[float],
 ) -> float:
     if last_price is None:
-        # no prior price: use midpoint of the two tied prices
+        # no prior price: use midpoint of the two tied prices.
+        # Ties (equidistant from midpoint) keep current_best, matching the
+        # tie-break rule used below when last_price is known.
         midpoint = (candidate + current_best) / 2.0
-        return min([candidate, current_best], key=lambda p: abs(p - midpoint))
+        return min([current_best, candidate], key=lambda p: abs(p - midpoint))
     dist_candidate = abs(candidate - last_price)
     dist_best = abs(current_best - last_price)
     return candidate if dist_candidate < dist_best else current_best
@@ -125,7 +134,7 @@ def _match_pro_rata(
     sells: list[Order],
     price: float,
     block_index: int,
-) -> tuple[list[Trade], set[str], set[str]]:
+) -> tuple[list[Trade], dict[str, int], dict[str, int]]:
     """
     Match buys against sells at `price` using pro-rata allocation when multiple
     sellers (or buyers) tie at the same limit price.
@@ -135,10 +144,11 @@ def _match_pro_rata(
     - For each buy, gather all sells still eligible at the clearing price and
       group them by limit_price tier (ascending). Within each tier apply pro-rata.
     - Symmetric logic applies in reverse for the sell side.
+
+    Returns the trades plus the remaining (unfilled) quantity per order id,
+    so callers can tell partial fills apart from full ones.
     """
     trades: list[Trade] = []
-    matched_buy_ids: set[str] = set()
-    matched_sell_ids: set[str] = set()
 
     # mutable remaining quantities
     buy_rem: dict[str, int] = {o.order_id: o.quantity for o in buys}
@@ -160,7 +170,12 @@ def _match_pro_rata(
             if buy_rem[buy.order_id] == 0:
                 break
 
-            tier = [s for s in sells_by_price[sell_price] if sell_rem[s.order_id] > 0]
+            # Exclude sells from the SAME investor: an investor cannot trade with
+            # itself (self-matching a buy against its own sell is meaningless).
+            tier = [
+                s for s in sells_by_price[sell_price]
+                if sell_rem[s.order_id] > 0 and s.investor_id != buy.investor_id
+            ]
             if not tier:
                 continue
 
@@ -201,7 +216,5 @@ def _match_pro_rata(
                 trades.append(trade)
                 buy_rem[buy.order_id] -= qty
                 sell_rem[seller.order_id] -= qty
-                matched_buy_ids.add(buy.order_id)
-                matched_sell_ids.add(seller.order_id)
 
-    return trades, matched_buy_ids, matched_sell_ids
+    return trades, buy_rem, sell_rem

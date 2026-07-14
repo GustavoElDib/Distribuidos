@@ -4,7 +4,6 @@ import asyncio
 import logging
 from collections import deque
 from datetime import datetime, timezone
-from statistics import mean
 from typing import Optional
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -17,7 +16,7 @@ from .blockchain import Block, BlockChain, Order
 from .config import Config
 from .consensus import ConsensusManager
 from .crypto import load_private_key, load_peer_keys
-from .db import Database
+from .db import make_database
 from .gossip import GossipManager
 from .messages import (
     Message,
@@ -25,6 +24,7 @@ from .messages import (
     BlockVotePayload,
     BlockCommitPayload,
     BlockCandidatePayload,
+    BlockRejectedPayload,
     ChainSyncRequestPayload,
     ChainSyncResponsePayload,
     CloseWindowPayload,
@@ -44,7 +44,7 @@ class BankNode:
         self.config = config
 
         self.blockchain: BlockChain = BlockChain()
-        self.db: Database = Database(config.this_bank.db_url)
+        self.db = make_database(config.this_bank.db_url)
 
         self.gossip_manager: GossipManager = GossipManager(self)
         self.sync_manager: SyncManager = SyncManager(self)
@@ -64,9 +64,15 @@ class BankNode:
         # rolling window of recent block order counts
         self._recent_block_counts: deque[int] = deque(maxlen=config.rolling_window_size)
         self._last_block_time: float = 0.0
+        self._auction_window_opened: float = 0.0  # when the current window started
 
         self._block_production_lock = asyncio.Lock()
         self._leader_timeout_task: Optional[asyncio.Task] = None
+
+        # Human-in-the-loop voting: candidate block awaiting this bank
+        # manager's manual approve/reject decision (shown as popup in dashboard)
+        self._pending_manager_vote: Optional[dict] = None
+        self._manager_vote_future: Optional[asyncio.Future[bool]] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -92,12 +98,14 @@ class BankNode:
         )
         logger.info("bank %s listening on %s:%d", self.bank_id, cfg.host, cfg.port)
 
+        self._last_block_time = asyncio.get_event_loop().time()
+        self._auction_window_opened = self._last_block_time
+
         self._tasks = [
             asyncio.create_task(self._peer_connect_loop(), name="peer_connect"),
             asyncio.create_task(self._heartbeat_loop(), name="heartbeat"),
-            asyncio.create_task(self._block_trigger_loop(), name="block_trigger"),
+            asyncio.create_task(self._auction_timer_loop(), name="auction_timer"),
         ]
-        self._last_block_time = asyncio.get_event_loop().time()
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -172,6 +180,10 @@ class BankNode:
             block = Block.from_dict(payload.block)
             asyncio.create_task(self._handle_block_commit(block))
 
+        elif mt == MessageType.BLOCK_REJECTED:
+            payload = BlockRejectedPayload.from_dict(message.payload)
+            self._handle_block_rejected(payload)
+
         elif mt == MessageType.CHAIN_SYNC_REQUEST:
             payload = ChainSyncRequestPayload.from_dict(message.payload)
             await self._handle_chain_sync(payload.from_index, writer)
@@ -217,7 +229,18 @@ class BankNode:
                 logger.warning("ack to leader %s failed: %s", leader_id, exc)
 
     async def _handle_block_candidate(self, candidate: Block, sender: str) -> None:
-        accepted = await self.consensus_manager.verify_block(candidate)
+        from .crypto import sign_block
+
+        # Automatic verification produces a RECOMMENDATION for the manager.
+        auto_ok = await self.consensus_manager.verify_block(candidate)
+
+        # Wait for the bank manager to manually approve/reject via the dashboard
+        # popup. Falls back to the automatic recommendation on timeout so the
+        # system still makes progress if no human is watching.
+        accepted = await self._await_manager_decision(candidate, sender, auto_ok)
+
+        vote_data = f"{candidate.index}:{candidate.block_hash}:{accepted}"
+        vote_sig = sign_block(self.private_key, vote_data)
         vote = build_message(
             MessageType.BLOCK_VOTE,
             self.bank_id,
@@ -225,7 +248,8 @@ class BankNode:
                 block_index=candidate.index,
                 block_hash=candidate.block_hash,
                 accepted=accepted,
-                reason="" if accepted else "auction mismatch",
+                reason="" if accepted else "rejeitado pelo gestor",
+                signature=vote_sig,
             ),
         )
         writer = self.peer_writers.get(sender)
@@ -236,6 +260,58 @@ class BankNode:
             except Exception as exc:
                 logger.warning("vote send to %s failed: %s", sender, exc)
 
+    async def _await_manager_decision(
+        self, candidate: Block, sender: str, auto_ok: bool
+    ) -> bool:
+        """Expose the candidate to the dashboard and wait for the manager's click."""
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future[bool] = loop.create_future()
+        self._manager_vote_future = fut
+        self._pending_manager_vote = {
+            "block_index": candidate.index,
+            "block_hash": candidate.block_hash,
+            "producer_id": candidate.producer_id,
+            "orders_count": len(candidate.orders),
+            "trades_count": len(candidate.trades),
+            "trades": [t.to_dict() for t in candidate.trades],
+            "clearing_prices": candidate.clearing_prices,
+            "auto_recommendation": auto_ok,
+            "is_eod": candidate.is_eod,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "deadline_seconds": self.config.manager_vote_timeout_seconds,
+        }
+        logger.info(
+            "block %d from %s awaiting manager decision (auto recommends %s)",
+            candidate.index, sender, "ACCEPT" if auto_ok else "REJECT",
+        )
+        try:
+            decision = await asyncio.wait_for(
+                fut, timeout=self.config.manager_vote_timeout_seconds
+            )
+            logger.info("manager voted %s on block %d",
+                        "ACCEPT" if decision else "REJECT", candidate.index)
+        except asyncio.TimeoutError:
+            decision = auto_ok
+            logger.info(
+                "manager did not vote on block %d in time; using auto recommendation=%s",
+                candidate.index, auto_ok,
+            )
+        finally:
+            self._pending_manager_vote = None
+            self._manager_vote_future = None
+        return decision
+
+    def submit_manager_vote(self, approve: bool) -> bool:
+        """Called by the API when the manager clicks approve/reject in the popup."""
+        fut = self._manager_vote_future
+        if fut is not None and not fut.done():
+            fut.set_result(approve)
+            return True
+        return False
+
+    def get_pending_manager_vote(self) -> Optional[dict]:
+        return self._pending_manager_vote
+
     async def _handle_block_commit(self, block: Block) -> None:
         try:
             await self.consensus_manager.commit_block(block)
@@ -243,25 +319,32 @@ class BankNode:
         except ValueError as exc:
             logger.error("block commit rejected: %s", exc)
 
+    def _handle_block_rejected(self, payload: BlockRejectedPayload) -> None:
+        """A leader announced its block was rejected — rotate to the new leader."""
+        # Only relevant if we're still at the same height (no block committed).
+        if payload.block_index != len(self.blockchain):
+            return
+        self.consensus_manager.set_round(payload.round)
+        self._auction_window_opened = asyncio.get_event_loop().time()
+        logger.info(
+            "block %d rejected by managers; round=%d, new leader=%s (fresh auction)",
+            payload.block_index,
+            payload.round,
+            self.consensus_manager.get_current_leader(len(self.blockchain)),
+        )
+
     # ------------------------------------------------------------------
     # Block production (leader path)
     # ------------------------------------------------------------------
 
-    async def _trigger_block_production(self) -> None:
+    async def _trigger_block_production(self, force: bool = False) -> None:
         async with self._block_production_lock:
             block_index = len(self.blockchain)
             leader_id = self.consensus_manager.get_current_leader(block_index)
-            if leader_id != self.bank_id:
+            if leader_id != self.bank_id and not force:
                 return
 
             logger.info("bank %s is leader for block %d", self.bank_id, block_index)
-
-            close_msg = build_message(
-                MessageType.CLOSE_WINDOW,
-                self.bank_id,
-                CloseWindowPayload(block_index=block_index),
-            )
-            await self.broadcast_to_all(close_msg)
 
             sync_result = await self.sync_manager.run_sync_round(self.bank_id, block_index)
             block = await self.consensus_manager.produce_block(sync_result, block_index)
@@ -277,16 +360,53 @@ class BankNode:
                 await self.consensus_manager.commit_block(block)
                 self._record_block_produced(len(block.orders))
             else:
+                # Block rejected by the managers' votes. Do NOT re-propose the
+                # same block. Instead rotate leadership to the next bank and let
+                # a fresh auction happen. Pending orders are kept (not cleared).
+                new_round = self.consensus_manager.advance_round()
                 logger.warning(
-                    "block %d rejected: accept=%d reject=%d",
+                    "block %d REJECTED (accept=%d reject=%d) — rotating to round %d, "
+                    "new leader=%s",
                     block_index,
                     vote_result.accept_count,
                     vote_result.reject_count,
+                    new_round,
+                    self.consensus_manager.get_current_leader(block_index),
                 )
+                rejected_msg = build_message(
+                    MessageType.BLOCK_REJECTED,
+                    self.bank_id,
+                    BlockRejectedPayload(block_index=block_index, round=new_round),
+                )
+                await self.broadcast_to_all(rejected_msg)
+                # Start a fresh auction window so the next leader runs a new leilão.
+                self._auction_window_opened = asyncio.get_event_loop().time()
 
     def _record_block_produced(self, order_count: int) -> None:
         self._recent_block_counts.append(order_count)
-        self._last_block_time = asyncio.get_event_loop().time()
+        now = asyncio.get_event_loop().time()
+        self._last_block_time = now
+        self._auction_window_opened = now  # reset window after each block
+
+    def get_auction_status(self) -> dict:
+        """Return auction timer info for the dashboard."""
+        cfg = self.config
+        now = asyncio.get_event_loop().time()
+        interval = cfg.auction_interval_seconds
+        elapsed = now - self._auction_window_opened
+        remaining = max(0.0, interval - elapsed)
+        block_index = len(self.blockchain)
+        leader_id = self.consensus_manager.get_current_leader(block_index)
+        is_leader = leader_id == self.bank_id
+        return {
+            "auction_interval_seconds": interval,
+            "elapsed_seconds": round(elapsed, 1),
+            "remaining_seconds": round(remaining, 1),
+            "current_leader": leader_id,
+            "is_leader": is_leader,
+            "next_block_index": block_index,
+            "consensus_round": self.consensus_manager.current_round,
+        }
 
     # ------------------------------------------------------------------
     # Background loops
@@ -338,26 +458,33 @@ class BankNode:
                     except Exception:
                         pass
 
-    async def _block_trigger_loop(self) -> None:
+    async def _auction_timer_loop(self) -> None:
+        """Leader-controlled auction timer.
+
+        The LEADER is responsible for closing the order window and producing
+        a block every `auction_interval_seconds`. Non-leaders do nothing here —
+        they rely on BLOCK_COMMIT messages to stay in sync.
+        """
+        cfg = self.config
         while True:
-            await asyncio.sleep(10)
-            pending_orders = await self.gossip_manager.get_pending_orders()
-            pending_count = len(pending_orders)
+            await asyncio.sleep(5)  # check every 5s so countdown is responsive
+
+            block_index = len(self.blockchain)
+            leader_id = self.consensus_manager.get_current_leader(block_index)
+
+            if leader_id != self.bank_id:
+                continue  # not the leader for this round — do nothing
+
             now = asyncio.get_event_loop().time()
-            time_since_last = now - self._last_block_time
+            elapsed = now - self._auction_window_opened
 
-            if self._recent_block_counts:
-                rolling_avg = mean(self._recent_block_counts)
-                volume_trigger = pending_count > rolling_avg * (
-                    1.0 + self.config.volume_trigger_pct
-                )
-            else:
-                volume_trigger = pending_count > 0
-
-            time_trigger = time_since_last > self.config.block_interval_seconds
-
-            if volume_trigger or time_trigger:
-                asyncio.create_task(self._trigger_block_production())
+            if elapsed >= cfg.auction_interval_seconds:
+                if not self._block_production_lock.locked():
+                    logger.info(
+                        "auction timer fired for block %d (elapsed=%.0fs)",
+                        block_index, elapsed,
+                    )
+                    asyncio.create_task(self._trigger_block_production())
 
     # ------------------------------------------------------------------
     # Chain sync

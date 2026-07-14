@@ -1,8 +1,6 @@
 # Machine 1 — banks 0, 1, 2
 # Set MACHINE2_IP to the LAN IP of machine 2 before running.
 # Example: MACHINE2_IP=192.168.1.20 docker compose -f docker-compose.machine1.yml up
-version: "3.9"
-
 networks:
   exchange_net:
     driver: bridge

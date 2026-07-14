@@ -26,14 +26,18 @@ class Config:
     # Gossip
     gossip_fanout: int = 3
 
-    # Block trigger
+    # Auction timer (leader-controlled)
+    auction_interval_seconds: int = 300  # 5 min default
+
+    # Block trigger (legacy fallback)
     rolling_window_size: int = 5
     volume_trigger_pct: float = 0.05
     block_interval_seconds: int = 1800
 
     # Timeouts
     sync_timeout_seconds: int = 10
-    vote_timeout_seconds: int = 10
+    vote_timeout_seconds: int = 90          # leader waits this long for manager votes
+    manager_vote_timeout_seconds: int = 75  # manager has this long to click before auto-fallback
     leader_timeout_seconds: int = 15
     heartbeat_interval_seconds: int = 5
     peer_timeout_seconds: int = 20
@@ -42,6 +46,9 @@ class Config:
     market_open: time = field(default_factory=lambda: time(10, 0))
     market_close: time = field(default_factory=lambda: time(18, 0))
     order_cutoff: time = field(default_factory=lambda: time(17, 55))
+
+    # HTTP API
+    api_port: int = 8000
 
     # Stocks
     stock_universe: list[str] = field(default_factory=lambda: [
@@ -106,10 +113,13 @@ def load_config() -> Config:
         gossip_fanout=_env_int("GOSSIP_FANOUT", 3),
         rolling_window_size=_env_int("ROLLING_WINDOW_SIZE", 5),
         volume_trigger_pct=_env_float("VOLUME_TRIGGER_PCT", 0.05),
+        auction_interval_seconds=_env_int("AUCTION_INTERVAL_SECONDS", 300),
         block_interval_seconds=_env_int("BLOCK_INTERVAL_SECONDS", 1800),
         sync_timeout_seconds=_env_int("SYNC_TIMEOUT_SECONDS", 10),
-        vote_timeout_seconds=_env_int("VOTE_TIMEOUT_SECONDS", 10),
+        vote_timeout_seconds=_env_int("VOTE_TIMEOUT_SECONDS", 90),
+        manager_vote_timeout_seconds=_env_int("MANAGER_VOTE_TIMEOUT_SECONDS", 75),
         leader_timeout_seconds=_env_int("LEADER_TIMEOUT_SECONDS", 15),
         heartbeat_interval_seconds=_env_int("HEARTBEAT_INTERVAL_SECONDS", 5),
         peer_timeout_seconds=_env_int("PEER_TIMEOUT_SECONDS", 20),
+        api_port=_env_int("API_PORT", 8000),
     )

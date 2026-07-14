@@ -11,6 +11,8 @@ from .blockchain import Block, Order, Trade, EodSnapshot
 
 logger = logging.getLogger(__name__)
 
+INITIAL_CASH_BALANCE = 100_000.00
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS blocks (
     index           INTEGER PRIMARY KEY,
@@ -31,7 +33,8 @@ CREATE TABLE IF NOT EXISTS orders (
     side            TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
     quantity        INTEGER NOT NULL CHECK (quantity > 0),
     limit_price     NUMERIC(12, 2) NOT NULL CHECK (limit_price > 0),
-    status          TEXT NOT NULL CHECK (status IN ('pending', 'matched', 'expired', 'cancelled')),
+    status          TEXT NOT NULL CHECK (status IN ('pending', 'matched', 'partial', 'expired', 'cancelled')),
+    filled_quantity INTEGER NOT NULL DEFAULT 0 CHECK (filled_quantity >= 0),
     submitted_at    TIMESTAMPTZ NOT NULL,
     block_index     INTEGER REFERENCES blocks(index)
 );
@@ -96,6 +99,16 @@ class Database:
         self._pool = await asyncpg.create_pool(self._db_url, min_size=2, max_size=10)
         async with self._pool.acquire() as conn:
             await conn.execute(_SCHEMA)
+            # Migrate tables created before the 'partial' fill status existed.
+            await conn.execute(
+                "ALTER TABLE orders ADD COLUMN IF NOT EXISTS filled_quantity "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            await conn.execute("ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check")
+            await conn.execute(
+                "ALTER TABLE orders ADD CONSTRAINT orders_status_check "
+                "CHECK (status IN ('pending', 'matched', 'partial', 'expired', 'cancelled'))"
+            )
         logger.info("database initialized")
 
     async def close(self) -> None:
@@ -178,13 +191,14 @@ class Database:
             )
 
     async def update_order_status(
-        self, order_id: str, status: str, block_index: int
+        self, order_id: str, status: str, block_index: int, filled_quantity: int = 0
     ) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "UPDATE orders SET status=$1, block_index=$2 WHERE order_id=$3",
+                "UPDATE orders SET status=$1, block_index=$2, filled_quantity=$3 WHERE order_id=$4",
                 status,
                 block_index,
+                filled_quantity,
                 order_id,
             )
 
@@ -258,6 +272,17 @@ class Database:
                 "SELECT * FROM investors WHERE investor_id=$1", investor_id
             )
         return dict(row) if row else None
+
+    async def ensure_investor(self, investor_id: str, bank_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO investors (investor_id, bank_id, cash_balance, cash_reserved)
+                VALUES ($1, $2, $3, 0)
+                ON CONFLICT (investor_id) DO NOTHING
+                """,
+                investor_id, bank_id, INITIAL_CASH_BALANCE,
+            )
 
     async def update_investor_balances(
         self,
@@ -391,16 +416,39 @@ class Database:
     async def persist_block(self, block: Block) -> None:
         await self.insert_block(block)
         await self.insert_orders(block.orders)
-        matched_ids = {t.buyer_order_id for t in block.trades} | {
-            t.seller_order_id for t in block.trades
-        }
+        order_by_id = {o.order_id: o for o in block.orders}
         for order in block.orders:
-            if order.order_id in matched_ids:
-                await self.update_order_status(order.order_id, "matched", block.index)
+            await self.ensure_investor(order.investor_id, order.bank_id)
+
+        # A call-auction round is single-shot: any quantity an order doesn't
+        # fill here is cancelled, not carried over to a future round. Track
+        # the actual filled quantity so partial fills aren't reported as if
+        # the whole order matched.
+        filled_qty: dict[str, int] = {}
+        for trade in block.trades:
+            filled_qty[trade.buyer_order_id] = filled_qty.get(trade.buyer_order_id, 0) + trade.quantity
+            filled_qty[trade.seller_order_id] = filled_qty.get(trade.seller_order_id, 0) + trade.quantity
+
+        for order in block.orders:
+            filled = filled_qty.get(order.order_id, 0)
+            if filled >= order.quantity:
+                status = "matched"
+            elif filled > 0:
+                status = "partial"
             else:
                 status = "cancelled" if block.is_eod else "expired"
-                await self.update_order_status(order.order_id, status, block.index)
+            await self.update_order_status(order.order_id, status, block.index, filled)
         await self.insert_trades(block.trades)
+        for trade in block.trades:
+            notional = trade.quantity * trade.price
+            buyer = order_by_id.get(trade.buyer_order_id)
+            seller = order_by_id.get(trade.seller_order_id)
+            if buyer is not None:
+                await self.update_investor_balances(buyer.investor_id, -notional, 0)
+                await self.upsert_portfolio(buyer.investor_id, trade.stock, trade.quantity, 0)
+            if seller is not None:
+                await self.update_investor_balances(seller.investor_id, notional, 0)
+                await self.upsert_portfolio(seller.investor_id, trade.stock, -trade.quantity, 0)
         for stock, price in block.clearing_prices.items():
             volume = sum(t.quantity for t in block.trades if t.stock == stock)
             await self.upsert_price_history(stock, block.index, price, volume)
@@ -408,3 +456,47 @@ class Database:
             await self.insert_eod_ohlc(
                 block.eod_snapshot.daily_ohlc, datetime.now(timezone.utc).date()
             )
+
+    # ------------------------------------------------------------------
+    # API query helpers (used by api.py to avoid direct pool access)
+    # ------------------------------------------------------------------
+
+    async def get_recent_orders(self, limit: int = 50) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT order_id, investor_id, bank_id, stock, side, quantity, "
+                "limit_price, status, filled_quantity, submitted_at, block_index "
+                "FROM orders ORDER BY submitted_at DESC LIMIT $1",
+                limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def get_recent_trades(self, limit: int = 50) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT trade_id, stock, buyer_bank_id, seller_bank_id, "
+                "quantity, price, block_index, traded_at "
+                "FROM trades ORDER BY traded_at DESC LIMIT $1",
+                limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def get_investor_portfolio(self, investor_id: str) -> Optional[tuple]:
+        inv = await self.get_investor(investor_id)
+        if inv is None:
+            return None
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT stock, quantity, reserved FROM portfolios "
+                "WHERE investor_id=$1 AND quantity > 0",
+                investor_id,
+            )
+        return inv, [dict(r) for r in rows]
+
+
+def make_database(db_url: str) -> "Database":
+    """Factory: returns SqliteDatabase for sqlite:// URLs, Database for postgresql://."""
+    if db_url.startswith("sqlite"):
+        from .db_sqlite import SqliteDatabase
+        return SqliteDatabase(db_url)  # type: ignore[return-value]
+    return Database(db_url)

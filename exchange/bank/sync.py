@@ -40,10 +40,19 @@ class SyncManager:
 
         self._node.gossip_manager.enable_full_broadcast()
 
-        # create futures for each expected peer before sending anything
+        # create futures for each expected peer BEFORE sending anything,
+        # so responses arriving immediately after CLOSE_WINDOW are not lost
         loop = asyncio.get_event_loop()
         for peer_id in expected_banks:
             self._pending_sync[peer_id] = loop.create_future()
+
+        # send CLOSE_WINDOW so peers know to sync their orders
+        close_msg = build_message(
+            MessageType.CLOSE_WINDOW,
+            cfg.this_bank.bank_id,
+            CloseWindowPayload(block_index=block_index),
+        )
+        await self._node.broadcast_to_all(close_msg)
 
         # broadcast our own pending orders to all peers
         own_orders = await self._node.gossip_manager.get_pending_orders()

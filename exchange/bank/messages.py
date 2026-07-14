@@ -20,6 +20,7 @@ class MessageType(str, Enum):
     BLOCK_CANDIDATE = "BLOCK_CANDIDATE"
     BLOCK_VOTE = "BLOCK_VOTE"
     BLOCK_COMMIT = "BLOCK_COMMIT"
+    BLOCK_REJECTED = "BLOCK_REJECTED"
     CHAIN_SYNC_REQUEST = "CHAIN_SYNC_REQUEST"
     CHAIN_SYNC_RESPONSE = "CHAIN_SYNC_RESPONSE"
     HEARTBEAT = "HEARTBEAT"
@@ -131,6 +132,7 @@ class BlockVotePayload:
     block_hash: str
     accepted: bool
     reason: str = ""
+    signature: str = ""  # Ed25519 signature over "block_index:block_hash:accepted"
 
     def to_dict(self) -> dict:
         return {
@@ -138,6 +140,7 @@ class BlockVotePayload:
             "block_hash": self.block_hash,
             "accepted": self.accepted,
             "reason": self.reason,
+            "signature": self.signature,
         }
 
     @classmethod
@@ -147,6 +150,7 @@ class BlockVotePayload:
             block_hash=d["block_hash"],
             accepted=d["accepted"],
             reason=d.get("reason", ""),
+            signature=d.get("signature", ""),
         )
 
 
@@ -160,6 +164,24 @@ class BlockCommitPayload:
     @classmethod
     def from_dict(cls, d: dict) -> "BlockCommitPayload":
         return cls(block=d["block"])
+
+
+@dataclass
+class BlockRejectedPayload:
+    """Broadcast by the leader when its block is rejected by manager votes.
+
+    Signals all nodes to advance the consensus round so leadership rotates
+    to the next bank for a fresh auction.
+    """
+    block_index: int
+    round: int
+
+    def to_dict(self) -> dict:
+        return {"block_index": self.block_index, "round": self.round}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BlockRejectedPayload":
+        return cls(block_index=d["block_index"], round=d["round"])
 
 
 @dataclass

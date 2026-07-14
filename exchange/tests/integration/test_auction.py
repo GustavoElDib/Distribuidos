@@ -19,8 +19,13 @@ def _order(
     price: float,
     stock: str = "PETR4",
     bank_id: str = "bank_0",
-    investor_id: str = "inv_0",
+    investor_id: str | None = None,
 ) -> Order:
+    # Default to distinct buyer/seller investor ids: the auction excludes
+    # self-trades (same investor_id on both sides), so fixtures that don't
+    # care about investor identity must not accidentally collide.
+    if investor_id is None:
+        investor_id = "inv_buyer" if side == "buy" else "inv_seller"
     return Order(
         order_id=str(uuid.uuid4()),
         investor_id=investor_id,
