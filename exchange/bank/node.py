@@ -153,9 +153,12 @@ class BankNode:
     # TCP server
     # ------------------------------------------------------------------
 
+    # node.py
+
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        connected_peer_id: Optional[str] = None
         try:
             while True:
                 line = await reader.readline()
@@ -163,6 +166,19 @@ class BankNode:
                     break
                 try:
                     msg = Message.from_json(line.decode("utf-8").strip())
+
+                    # Registra o writer desta conexão inbound assim que soubermos
+                    # quem é o remetente — permite responder (votos, acks, sync)
+                    # mesmo que este nó não consiga abrir uma conexão outbound
+                    # de volta para o peer (NAT/firewall assimétrico).
+                    if connected_peer_id is None and msg.sender_id != self.bank_id:
+                        connected_peer_id = msg.sender_id
+                        if connected_peer_id not in self.peer_writers:
+                            self.peer_writers[connected_peer_id] = writer
+                            logger.info(
+                                "registered inbound writer for peer %s", connected_peer_id
+                            )
+
                     await self._handle_message(msg, writer)
                 except Exception as exc:
                     logger.warning("message parse error: %s", exc)
@@ -171,6 +187,8 @@ class BankNode:
         except Exception as exc:
             logger.warning("connection closed: %s", exc)
         finally:
+            if connected_peer_id and self.peer_writers.get(connected_peer_id) is writer:
+                self.peer_writers.pop(connected_peer_id, None)
             writer.close()
 
     async def _handle_message(
