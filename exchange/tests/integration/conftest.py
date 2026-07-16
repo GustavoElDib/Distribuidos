@@ -52,6 +52,8 @@ def _make_cluster_config(
                 heartbeat_interval_seconds=2,
                 peer_timeout_seconds=8,
                 block_interval_seconds=9999,  # never auto-trigger
+                min_trades_per_block=0,  # muitos testes produzem blocos sem trades
+
             )
         )
     return configs

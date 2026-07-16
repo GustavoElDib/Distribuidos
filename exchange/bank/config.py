@@ -29,6 +29,9 @@ class Config:
     # Auction timer (leader-controlled)
     auction_interval_seconds: int = 300  # 5 min default
 
+    # Mínimo de trades no leilão para um bloco ser criado (blocos EOD são isentos)
+    min_trades_per_block: int = 1
+
     # Block trigger (legacy fallback)
     rolling_window_size: int = 5
     volume_trigger_pct: float = 0.05
@@ -114,6 +117,7 @@ def load_config() -> Config:
         rolling_window_size=_env_int("ROLLING_WINDOW_SIZE", 5),
         volume_trigger_pct=_env_float("VOLUME_TRIGGER_PCT", 0.05),
         auction_interval_seconds=_env_int("AUCTION_INTERVAL_SECONDS", 300),
+        min_trades_per_block=_env_int("MIN_TRADES_PER_BLOCK", 1),
         block_interval_seconds=_env_int("BLOCK_INTERVAL_SECONDS", 1800),
         sync_timeout_seconds=_env_int("SYNC_TIMEOUT_SECONDS", 10),
         vote_timeout_seconds=_env_int("VOTE_TIMEOUT_SECONDS", 90),

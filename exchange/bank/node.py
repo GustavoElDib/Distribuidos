@@ -390,6 +390,20 @@ class BankNode:
 
             sync_result = await self.sync_manager.run_sync_round(self.bank_id, block_index)
             block = await self.consensus_manager.produce_block(sync_result, block_index)
+
+            # Filtro: só cria bloco se o leilão gerou trades suficientes.
+            # Blocos EOD são isentos (o snapshot de fim de dia é obrigatório).
+            min_trades = self.config.min_trades_per_block
+            if not block.is_eod and len(block.trades) < min_trades:
+                logger.info(
+                    "block %d NOT created: auction produced %d trade(s), minimum is %d "
+                    "(pending orders kept for the next auction)",
+                    block_index, len(block.trades), min_trades,
+                )
+                # reinicia a janela para o próximo leilão; ordens pendentes ficam
+                self._auction_window_opened = asyncio.get_event_loop().time()
+                return
+
             vote_result = await self.consensus_manager.run_voting_round(block)
 
             if vote_result.accepted:

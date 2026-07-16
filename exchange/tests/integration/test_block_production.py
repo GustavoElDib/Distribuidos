@@ -87,6 +87,42 @@ async def test_block_contains_all_agreed_orders(three_bank_cluster: list[BankNod
 
 
 @pytest.mark.asyncio
+async def test_no_block_created_without_trades(three_bank_cluster: list[BankNode]) -> None:
+    """Com min_trades_per_block=1, leilão sem casamento de ordens não gera bloco."""
+    nodes = three_bank_cluster
+    for node in nodes:
+        node.config.min_trades_per_block = 1
+
+    # apenas ordens de compra — nenhum trade possível
+    only_buys = [_order(nodes[i % len(nodes)].bank_id, "buy", 10.0) for i in range(3)]
+    for o in only_buys:
+        n = next(node for node in nodes if node.bank_id == o.bank_id)
+        n.gossip_manager._pending[o.order_id] = o
+
+    await _produce_block_on_leader(nodes)
+
+    for node in nodes:
+        assert len(node.blockchain) == 1, f"{node.bank_id} criou bloco sem trades"
+
+    # ordens pendentes são mantidas para o próximo leilão
+    leader_id = nodes[0].consensus_manager.get_current_leader(1)
+    leader = next(n for n in nodes if n.bank_id == leader_id)
+    pending = await leader.gossip_manager.get_pending_orders()
+    assert len(pending) >= 1
+
+    # ao adicionar a contraparte de venda, o bloco é criado normalmente
+    sell = _order(nodes[1].bank_id, "sell", 9.0)
+    nodes[1].gossip_manager._pending[sell.order_id] = sell
+
+    await _produce_block_on_leader(nodes)
+
+    for node in nodes:
+        assert len(node.blockchain) == 2, f"{node.bank_id} não criou bloco com trades"
+    block = nodes[0].blockchain.get_block(1)
+    assert len(block.trades) >= 1
+
+
+@pytest.mark.asyncio
 async def test_merkle_root_is_consistent(three_bank_cluster: list[BankNode]) -> None:
     nodes = three_bank_cluster
     buy = _order(nodes[0].bank_id, "buy", 10.0)

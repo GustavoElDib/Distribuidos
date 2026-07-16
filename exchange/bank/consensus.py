@@ -146,6 +146,14 @@ class ConsensusManager:
         chain = self._node.blockchain
         last = chain.get_last_block()
 
+        min_trades = self._node.config.min_trades_per_block
+        if not candidate.is_eod and len(candidate.trades) < min_trades:
+            logger.warning(
+                "verify: block %d has %d trade(s), minimum is %d — rejecting",
+                candidate.index, len(candidate.trades), min_trades,
+            )
+            return False
+
         if candidate.previous_hash != last.block_hash:
             logger.warning(
                 "verify: previous_hash mismatch on block %d", candidate.index

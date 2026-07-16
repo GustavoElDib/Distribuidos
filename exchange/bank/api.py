@@ -77,13 +77,19 @@ async def peers():
 
 
 @app.get("/api/blocks")
-async def get_blocks(limit: int = 20):
+async def get_blocks(page: int = 1, page_size: int = 10):
+    """Blocos paginados, do mais recente para o mais antigo (página 1 = últimos blocos)."""
     node = _get_node()
     chain = node.blockchain
     n = len(chain)
-    start = max(0, n - limit)
+    page_size = max(1, min(page_size, 100))
+    total_pages = max(1, -(-n // page_size))
+    page = max(1, min(page, total_pages))
+
+    newest = n - 1 - (page - 1) * page_size
+    oldest = max(0, newest - page_size + 1)
     result = []
-    for i in range(start, n):
+    for i in range(newest, oldest - 1, -1):
         block = chain.get_block(i)
         result.append({
             "index": block.index,
@@ -94,8 +100,13 @@ async def get_blocks(limit: int = 20):
             "block_hash": block.block_hash[:20] + "...",
             "is_eod": block.is_eod,
         })
-    result.reverse()
-    return {"blocks": result}
+    return {
+        "blocks": result,
+        "page": page,
+        "page_size": page_size,
+        "total_blocks": n,
+        "total_pages": total_pages,
+    }
 
 
 @app.get("/api/blocks/{index}")
@@ -405,6 +416,8 @@ _HTML = """<!DOCTYPE html>
     ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
     .navlink{color:var(--muted);text-decoration:none;font-size:13px;padding:4px 10px;border-radius:6px;border:1px solid var(--border)}
     .navlink:hover{color:var(--text);border-color:var(--accent)}
+    .pager{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:12px}
+    .pager-info{font-size:12px;color:var(--muted);min-width:170px;text-align:center}
     /* Vote modal */
     .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:10000;display:none;align-items:center;justify-content:center;backdrop-filter:blur(3px)}
     .modal-overlay.show{display:flex;animation:fadein .2s}
@@ -603,6 +616,7 @@ _HTML = """<!DOCTYPE html>
     <div style="font-size:11px;color:var(--muted);margin-top:8px">
       ⚠ O leilão só executa trades quando há ordens de <strong>compra E venda</strong> do mesmo ativo com preços sobrepostos.
       Use "Criar Ordens de Teste" para gerar pares compatíveis.
+      <strong>Um novo bloco só é criado se o leilão gerar pelo menos 1 trade</strong> — sem casamento, as ordens permanecem pendentes para o próximo leilão.
     </div>
   </div>
 
@@ -651,7 +665,7 @@ _HTML = """<!DOCTYPE html>
 
   <!-- Blocos -->
   <div class="section">
-    <h2>Blocos Recentes</h2>
+    <h2>Blocos da Chain <span id="blocks-total" style="font-size:12px;color:var(--muted);font-weight:400"></span></h2>
     <div style="overflow-x:auto">
     <table>
       <thead>
@@ -661,6 +675,11 @@ _HTML = """<!DOCTYPE html>
         <tr><td colspan="7" style="color:var(--muted);text-align:center">Nenhum bloco ainda</td></tr>
       </tbody>
     </table>
+    </div>
+    <div class="pager">
+      <button class="btn btn-sm btn-primary" id="blk-prev" onclick="changeBlockPage(-1)" disabled>&laquo; Mais recentes</button>
+      <span class="pager-info" id="blk-pageinfo">Página 1 de 1</span>
+      <button class="btn btn-sm btn-primary" id="blk-next" onclick="changeBlockPage(1)" disabled>Mais antigos &raquo;</button>
     </div>
   </div>
 
@@ -791,10 +810,20 @@ async function loadPending() {
   } catch(e) {}
 }
 
+const BLOCKS_PAGE_SIZE = 10;
+let blocksPage = 1;
+let blocksTotalPages = 1;
+
 async function loadBlocks() {
   try {
-    const r = await fetch('/api/blocks?limit=12');
+    const r = await fetch(`/api/blocks?page=${blocksPage}&page_size=${BLOCKS_PAGE_SIZE}`);
     const d = await r.json();
+    blocksPage = d.page;
+    blocksTotalPages = d.total_pages;
+    $('blk-pageinfo').textContent = `Página ${d.page} de ${d.total_pages}`;
+    $('blocks-total').textContent = `(${d.total_blocks} bloco${d.total_blocks === 1 ? '' : 's'})`;
+    $('blk-prev').disabled = d.page <= 1;
+    $('blk-next').disabled = d.page >= d.total_pages;
     const tbody = $('blocks-body');
     if (!d.blocks.length) return;
     tbody.innerHTML = d.blocks.map(b => `
@@ -808,6 +837,11 @@ async function loadBlocks() {
         <td>${b.is_eod ? '<span class="badge badge-yellow">EOD</span>' : ''}</td>
       </tr>`).join('');
   } catch(e) {}
+}
+
+function changeBlockPage(delta) {
+  blocksPage = Math.min(Math.max(1, blocksPage + delta), blocksTotalPages);
+  loadBlocks();
 }
 
 async function loadTrades() {
