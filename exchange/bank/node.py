@@ -52,6 +52,9 @@ class BankNode:
 
         # peer_id -> StreamWriter for outbound connections
         self.peer_writers: dict[str, asyncio.StreamWriter] = {}
+        # writers de conexões inbound ainda abertas — fechados no stop() para
+        # que Server.wait_closed() (Python 3.12+) não bloqueie indefinidamente
+        self._inbound_writers: set[asyncio.StreamWriter] = set()
         # peer_id -> last heartbeat timestamp
         self._peer_last_seen: dict[str, float] = {}
 
@@ -73,6 +76,12 @@ class BankNode:
         # manager's manual approve/reject decision (shown as popup in dashboard)
         self._pending_manager_vote: Optional[dict] = None
         self._manager_vote_future: Optional[asyncio.Future[bool]] = None
+        # Serializa candidatos concorrentes: sem isso, um segundo BLOCK_CANDIDATE
+        # sobrescrevia o future/popup do primeiro e os votos se cruzavam.
+        self._manager_vote_lock = asyncio.Lock()
+        # (index, block_hash) -> decisão já tomada; um candidato repetido recebe
+        # o mesmo voto sem abrir novo popup para o gestor.
+        self._cast_votes: dict[tuple[int, str], bool] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -139,6 +148,15 @@ class BankNode:
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        # Fecha todas as conexões (outbound e inbound) antes do wait_closed:
+        # no Python 3.12+ wait_closed() espera os handlers das conexões ainda
+        # abertas terminarem — com peers conectados, o stop travava para sempre.
+        for writer in list(self.peer_writers.values()) + list(self._inbound_writers):
+            try:
+                writer.close()
+            except Exception:
+                pass
+        self.peer_writers.clear()
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -159,6 +177,7 @@ class BankNode:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         connected_peer_id: Optional[str] = None
+        self._inbound_writers.add(writer)
         try:
             while True:
                 line = await reader.readline()
@@ -187,6 +206,7 @@ class BankNode:
         except Exception as exc:
             logger.warning("connection closed: %s", exc)
         finally:
+            self._inbound_writers.discard(writer)
             if connected_peer_id and self.peer_writers.get(connected_peer_id) is writer:
                 self.peer_writers.pop(connected_peer_id, None)
             writer.close()
@@ -277,13 +297,7 @@ class BankNode:
     async def _handle_block_candidate(self, candidate: Block, sender: str) -> None:
         from .crypto import sign_block
 
-        # Automatic verification produces a RECOMMENDATION for the manager.
-        auto_ok = await self.consensus_manager.verify_block(candidate)
-
-        # Wait for the bank manager to manually approve/reject via the dashboard
-        # popup. Falls back to the automatic recommendation on timeout so the
-        # system still makes progress if no human is watching.
-        accepted = await self._await_manager_decision(candidate, sender, auto_ok)
+        accepted = await self._decide_on_candidate(candidate, sender)
 
         vote_data = f"{candidate.index}:{candidate.block_hash}:{accepted}"
         vote_sig = sign_block(self.private_key, vote_data)
@@ -305,6 +319,57 @@ class BankNode:
                 await writer.drain()
             except Exception as exc:
                 logger.warning("vote send to %s failed: %s", sender, exc)
+        else:
+            logger.warning(
+                "no connection to leader %s — vote on block %d not sent",
+                sender, candidate.index,
+            )
+
+    async def _decide_on_candidate(self, candidate: Block, sender: str) -> bool:
+        """Decide o voto para um candidato, com dedupe e serialização.
+
+        - Candidato repetido (mesmo index+hash): reenvia a decisão anterior
+          sem novo popup.
+        - Candidato para altura já commitada: aceita se for exatamente o bloco
+          que temos na chain, rejeita caso contrário — sem envolver o gestor.
+        - Candidatos concorrentes são decididos um por vez (lock), para não
+          sobrescrever o popup/future do gestor.
+        """
+        def _known_decision() -> Optional[bool]:
+            cached = self._cast_votes.get((candidate.index, candidate.block_hash))
+            if cached is not None:
+                return cached
+            if candidate.index < len(self.blockchain):
+                committed = self.blockchain.get_block(candidate.index)
+                return committed.block_hash == candidate.block_hash
+            return None
+
+        decision = _known_decision()
+        if decision is not None:
+            return decision
+
+        async with self._manager_vote_lock:
+            # Reavalia: outro candidato pode ter sido commitado/votado
+            # enquanto esperávamos o lock.
+            decision = _known_decision()
+            if decision is not None:
+                return decision
+
+            # Automatic verification produces a RECOMMENDATION for the manager.
+            auto_ok = await self.consensus_manager.verify_block(candidate)
+
+            # Wait for the bank manager to manually approve/reject via the
+            # dashboard popup. Falls back to the automatic recommendation on
+            # timeout so the system still makes progress if no human is watching.
+            accepted = await self._await_manager_decision(candidate, sender, auto_ok)
+
+            self._cast_votes[(candidate.index, candidate.block_hash)] = accepted
+            # poda decisões de alturas já commitadas (resolvidas pela chain)
+            self._cast_votes = {
+                k: v for k, v in self._cast_votes.items()
+                if k[0] >= len(self.blockchain)
+            }
+            return accepted
 
     async def _await_manager_decision(
         self, candidate: Block, sender: str, auto_ok: bool
@@ -359,6 +424,17 @@ class BankNode:
         return self._pending_manager_vote
 
     async def _handle_block_commit(self, block: Block) -> None:
+        # Commit repetido ou conflitante para altura já commitada: ignora.
+        if block.index < len(self.blockchain):
+            existing = self.blockchain.get_block(block.index)
+            if existing.block_hash == block.block_hash:
+                logger.debug("duplicate commit for block %d ignored", block.index)
+            else:
+                logger.warning(
+                    "conflicting commit for block %d ignored (chain already has "
+                    "producer=%s)", block.index, existing.producer_id,
+                )
+            return
         try:
             await self.consensus_manager.commit_block(block)
             self._record_block_produced(len(block.orders))
@@ -425,6 +501,19 @@ class BankNode:
             vote_result = await self.consensus_manager.run_voting_round(block)
 
             if vote_result.accepted:
+                # A votação leva dezenas de segundos; se outro bloco foi
+                # commitado nesse meio-tempo, este candidato não encaixa mais
+                # na chain — descarta em vez de publicar um commit inválido.
+                last = self.blockchain.get_last_block()
+                if block.previous_hash != last.block_hash:
+                    logger.warning(
+                        "block %d accepted by votes but no longer extends the "
+                        "chain (another block was committed during voting) — "
+                        "discarding",
+                        block_index,
+                    )
+                    self._auction_window_opened = asyncio.get_event_loop().time()
+                    return
                 commit_msg = build_message(
                     MessageType.BLOCK_COMMIT,
                     self.bank_id,
@@ -635,6 +724,12 @@ class BankNode:
                 continue
             try:
                 self.blockchain.append(block)
+                # blocos perdidos enquanto o nó esteve fora: descarta do pool
+                # as ordens que eles já incluíram, senão seriam reenviadas ao
+                # líder no próximo sync e re-negociadas
+                await self.gossip_manager.remove_pending_orders(
+                    {o.order_id for o in block.orders}
+                )
                 await self.db.persist_block(block)
             except ValueError as exc:
                 logger.error("chain sync block %d rejected: %s", block.index, exc)

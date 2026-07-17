@@ -69,6 +69,15 @@ class GossipManager:
     async def get_pending_orders(self) -> list[Order]:
         return list(self._pending.values())
 
+    async def remove_pending_orders(self, order_ids: set[str]) -> None:
+        """Remove do pool apenas as ordens incluídas em um bloco commitado.
+
+        Ordens novas submetidas durante a votação continuam pendentes para o
+        próximo leilão (o clear total as descartava silenciosamente).
+        """
+        for oid in order_ids:
+            self._pending.pop(oid, None)
+
     async def clear_pending_orders(self) -> None:
         self._pending.clear()
         while not self._queue.empty():

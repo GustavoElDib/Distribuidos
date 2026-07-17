@@ -13,7 +13,7 @@ from bank.node import BankNode
 def _order(bank_id: str) -> Order:
     return Order(
         order_id=str(uuid.uuid4()),
-        investor_id="inv_test",
+        investor_id=f"inv_{uuid.uuid4().hex[:8]}",  # unico: o leilao exclui self-trade
         bank_id=bank_id,
         stock="PETR4",
         side="buy",
@@ -28,9 +28,11 @@ async def _produce_next_block(nodes: list[BankNode]) -> None:
     block_index = available[0].blockchain.get_last_block().index + 1
     leader_id = available[0].consensus_manager.get_current_leader(block_index)
     leaders = [n for n in available if n.bank_id == leader_id]
-    if not leaders:
-        return
-    await leaders[0]._trigger_block_production()
+    if leaders:
+        await leaders[0]._trigger_block_production()
+    else:
+        # líder da rodada está fora do ar — outro banco assume via force
+        await available[0]._trigger_block_production(force=True)
     await asyncio.sleep(0.8)
 
 
@@ -78,7 +80,8 @@ async def test_crashed_leader_triggers_next_leader(three_bank_cluster: list[Bank
     # next leader should step in (advance block_index by 1 due to skipped leader)
     next_leader_id = remaining[0].consensus_manager.get_current_leader(block_index + 1)
     next_leader = next((n for n in remaining if n.bank_id == next_leader_id), remaining[0])
-    await next_leader._trigger_block_production()
+    # o líder original caiu — o substituto produz via force
+    await next_leader._trigger_block_production(force=True)
     await asyncio.sleep(1.0)
 
     # at least one remaining bank committed a block
@@ -104,7 +107,8 @@ async def test_system_continues_with_minority_down(six_bank_cluster: list[BankNo
     if leaders:
         await leaders[0]._trigger_block_production()
     else:
-        await active[0]._trigger_block_production()
+        # líder da rodada está entre os que caíram — outro banco assume
+        await active[0]._trigger_block_production(force=True)
 
     await asyncio.sleep(1.0)
 

@@ -97,14 +97,26 @@ class SyncManager:
                     except Exception as exc:
                         logger.warning("ack send to %s failed: %s", peer_id, exc)
 
-        # merge and deduplicate
+        # merge and deduplicate — também descarta ordens que já entraram em
+        # bloco commitado (um peer atrasado pode reenviar ordens já negociadas)
+        committed = self._node.blockchain.committed_order_ids
         seen: set[str] = set()
         agreed: list[Order] = []
+        stale = 0
         for orders in done.values():
             for order in orders:
-                if order.order_id not in seen:
-                    seen.add(order.order_id)
-                    agreed.append(order)
+                if order.order_id in seen:
+                    continue
+                seen.add(order.order_id)
+                if order.order_id in committed:
+                    stale += 1
+                    continue
+                agreed.append(order)
+        if stale:
+            logger.warning(
+                "sync: descartadas %d ordem(ns) já incluídas em blocos anteriores",
+                stale,
+            )
 
         # cleanup futures
         self._pending_sync.clear()

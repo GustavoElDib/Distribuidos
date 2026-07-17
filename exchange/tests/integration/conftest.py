@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import AsyncGenerator
@@ -48,6 +49,9 @@ def _make_cluster_config(
                 # tight timeouts for tests
                 sync_timeout_seconds=3,
                 vote_timeout_seconds=3,
+                # sem gestor humano nos testes: cai imediatamente no voto
+                # automático (sem isso cada candidato espera 75s pelo popup)
+                manager_vote_timeout_seconds=0,
                 leader_timeout_seconds=5,
                 heartbeat_interval_seconds=2,
                 peer_timeout_seconds=8,
@@ -63,6 +67,10 @@ async def _spin_up_cluster(n: int) -> tuple[list[BankNode], TemporaryDirectory]:
     test_db_url = os.environ.get(
         "TEST_DB_URL", "postgresql://exchange:exchange@localhost/exchange_test"
     )
+    # sufixo único por cluster: sem ele os bancos de teste acumulam blocos de
+    # runs anteriores (a chain é restaurada do DB no start) e os testes que
+    # esperam uma chain só com o genesis falham
+    test_db_url = f"{test_db_url}_{uuid.uuid4().hex[:8]}"
     tmp = TemporaryDirectory()
     keys_dir = Path(tmp.name)
 

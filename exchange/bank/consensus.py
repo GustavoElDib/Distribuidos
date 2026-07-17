@@ -76,8 +76,14 @@ class ConsensusManager:
 
     @property
     def bft_quorum(self) -> int:
-        """Minimum accept votes required for BFT consensus (2f+1)."""
-        return 2 * self.bft_f + 1
+        """Minimum accept votes required for consensus.
+
+        2f+1 (BFT), mas nunca abaixo de maioria simples: quando n não é da
+        forma 3f+1 (ex.: n=3 → f=0 → 2f+1=1), o 2f+1 puro deixaria o líder
+        commitar sozinho mesmo com todos os outros gestores rejeitando.
+        """
+        n = len(self._sorted_bank_ids)
+        return max(2 * self.bft_f + 1, n // 2 + 1)
 
     def get_current_leader(self, block_index: int) -> str:
         n = len(self._sorted_bank_ids)
@@ -157,6 +163,20 @@ class ConsensusManager:
         if candidate.previous_hash != last.block_hash:
             logger.warning(
                 "verify: previous_hash mismatch on block %d", candidate.index
+            )
+            return False
+
+        # Rejeita blocos que re-incluem ordens já commitadas — sem isso, um
+        # líder com pool desatualizado re-executa os mesmos trades (com novos
+        # trade_ids) e o bloco duplicado passa em todas as outras checagens.
+        already = [
+            o.order_id for o in candidate.orders
+            if o.order_id in chain.committed_order_ids
+        ]
+        if already:
+            logger.warning(
+                "verify: block %d re-includes %d order(s) already committed — rejecting",
+                candidate.index, len(already),
             )
             return False
 
@@ -338,8 +358,13 @@ class ConsensusManager:
 
     async def commit_block(self, block: Block) -> None:
         self._node.blockchain.append(block)
+        # Remove do pool apenas as ordens deste bloco, e ANTES do persist:
+        # o persist_block é I/O lento e um CLOSE_WINDOW concorrente lia as
+        # pendentes ainda não limpas, reenviando ordens já negociadas ao líder.
+        await self._node.gossip_manager.remove_pending_orders(
+            {o.order_id for o in block.orders}
+        )
         await self._node.db.persist_block(block)
-        await self._node.gossip_manager.clear_pending_orders()
         # New block height starts a fresh round → normal leader rotation resumes.
         self.reset_round()
         logger.info(

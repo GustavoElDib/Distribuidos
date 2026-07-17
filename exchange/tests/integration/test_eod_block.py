@@ -14,7 +14,7 @@ from bank.node import BankNode
 def _order(bank_id: str, side: str = "buy", price: float = 10.0, stock: str = "PETR4") -> Order:
     return Order(
         order_id=str(uuid.uuid4()),
-        investor_id="inv_test",
+        investor_id=f"inv_{uuid.uuid4().hex[:8]}",  # unico: o leilao exclui self-trade
         bank_id=bank_id,
         stock=stock,
         side=side,
@@ -117,7 +117,10 @@ async def test_eod_ohlc_derived_from_day_blocks(three_bank_cluster: list[BankNod
     assert eod_block.eod_snapshot is not None
     ohlc = eod_block.eod_snapshot.daily_ohlc.get("PETR4")
     if ohlc:
+        # preços de clearing esperados por leilão (o tie-break escolhe o
+        # candidato mais próximo do último preço): 10.00, 11.00 e 10.50
+        # (no 3º leilão, 10.50 está mais perto do último preço 11.00 que 9.50)
         assert ohlc["open"] == 10.00
         assert ohlc["high"] == 11.00
-        assert ohlc["low"] == 9.50
-        assert ohlc["close"] == 9.50
+        assert ohlc["low"] == 10.00
+        assert ohlc["close"] == 10.50

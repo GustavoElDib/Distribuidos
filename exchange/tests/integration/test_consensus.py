@@ -14,7 +14,7 @@ from bank.node import BankNode
 def _order(bank_id: str) -> Order:
     return Order(
         order_id=str(uuid.uuid4()),
-        investor_id="inv_test",
+        investor_id=f"inv_{uuid.uuid4().hex[:8]}",  # unico: o leilao exclui self-trade
         bank_id=bank_id,
         stock="PETR4",
         side="buy",

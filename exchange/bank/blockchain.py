@@ -156,6 +156,9 @@ def _canonical_json(obj: dict) -> str:
 class BlockChain:
     def __init__(self) -> None:
         self._chain: list[Block] = []
+        # order_ids de todos os blocos commitados — impede que uma ordem já
+        # incluída em bloco (executada ou não) entre novamente em um bloco futuro
+        self._committed_order_ids: set[str] = set()
         self._init_genesis()
 
     def _init_genesis(self) -> None:
@@ -192,8 +195,22 @@ class BlockChain:
             raise ValueError(
                 f"block {block.index}: block_hash is invalid"
             )
+        duplicated = [
+            o.order_id for o in block.orders
+            if o.order_id in self._committed_order_ids
+        ]
+        if duplicated:
+            raise ValueError(
+                f"block {block.index}: {len(duplicated)} order(s) already "
+                f"committed in earlier blocks — duplicate trade rejected"
+            )
         self._chain.append(block)
+        self._committed_order_ids.update(o.order_id for o in block.orders)
         logger.info("appended block %d (producer=%s)", block.index, block.producer_id)
+
+    @property
+    def committed_order_ids(self) -> set[str]:
+        return self._committed_order_ids
 
     def get_last_block(self) -> Block:
         return self._chain[-1]

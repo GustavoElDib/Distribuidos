@@ -14,7 +14,9 @@ from bank.node import BankNode
 def _order(bank_id: str, side: str = "buy", price: float = 10.0) -> Order:
     return Order(
         order_id=str(uuid.uuid4()),
-        investor_id="inv_test",
+        # investidor único por ordem: o leilão exclui self-trade, então ordens
+        # do mesmo investidor nunca casam entre si
+        investor_id=f"inv_{uuid.uuid4().hex[:8]}",
         bank_id=bank_id,
         stock="PETR4",
         side=side,
