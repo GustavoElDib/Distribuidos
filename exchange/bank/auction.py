@@ -9,7 +9,6 @@ from typing import Optional
 
 from .blockchain import Order, Trade
 
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -24,7 +23,6 @@ def run_call_auction(
     block_index: int = 0,
     last_clearing_prices: Optional[dict[str, float]] = None,
 ) -> AuctionResult:
-    """Stateless call auction: given orders return trades and clearing prices."""
     if last_clearing_prices is None:
         last_clearing_prices = {}
 
@@ -83,7 +81,6 @@ def _auction_single_stock(
             best_volume = matched
             best_price = p
         elif matched == best_volume and matched > 0:
-            # tie-break: closest to last clearing price
             assert best_price is not None
             best_price = _tiebreak(p, best_price, last_price, candidate_prices)
 
@@ -97,15 +94,9 @@ def _auction_single_stock(
         eligible_buys, eligible_sells, best_price, block_index
     )
 
-    # If self-trade exclusion left no executable trades, there is no real
-    # clearing price — return None so no phantom price is recorded.
     if not trades:
         return [], None, list(orders)
 
-    # An order is unmatched (fully or partially) whenever it still has
-    # quantity left over after pro-rata allocation — not merely "didn't
-    # appear in any trade". A buy for 20 filled for only 10 must still be
-    # reported here; the leftover 10 don't roll over to a future auction.
     remaining = {**buy_rem, **sell_rem}
     unmatched = [o for o in orders if remaining.get(o.order_id, o.quantity) > 0]
 
@@ -136,26 +127,21 @@ def _match_pro_rata(
     block_index: int,
 ) -> tuple[list[Trade], dict[str, int], dict[str, int]]:
     """
-    Match buys against sells at `price` using pro-rata allocation when multiple
-    sellers (or buyers) tie at the same limit price.
+    Emparelha ordens de compra com ordens de venda a um determinado `preço`, utilizando alocação 
+    pro-rata quando múltiplos vendedores (ou compradores) apresentam o mesmo preço limite.
 
-    Strategy:
-    - Process buy orders one at a time (highest price first).
-    - For each buy, gather all sells still eligible at the clearing price and
-      group them by limit_price tier (ascending). Within each tier apply pro-rata.
-    - Symmetric logic applies in reverse for the sell side.
+    Estratégia:
+    - Processa as ordens de compra uma de cada vez (começando pelo preço mais alto).
+    - Para cada compra, reúne todas as ordens de venda ainda elegíveis ao preço de compensação 
+    e as agrupa por faixa de preço limite (em ordem crescente). Aplica-se a alocação *pro-rata* dentro de cada faixa.
+    - Aplica-se uma lógica simétrica, de forma inversa, para o lado da venda.
 
-    Returns the trades plus the remaining (unfilled) quantity per order id,
-    so callers can tell partial fills apart from full ones.
+    Retorna as operações realizadas e a quantidade restante (não executada) por ID de ordem, permitindo distinguir execuções parciais de execuções totais.
     """
     trades: list[Trade] = []
 
-    # mutable remaining quantities
     buy_rem: dict[str, int] = {o.order_id: o.quantity for o in buys}
     sell_rem: dict[str, int] = {o.order_id: o.quantity for o in sells}
-
-    buy_map = {o.order_id: o for o in buys}
-    sell_map = {o.order_id: o for o in sells}
 
     sells_by_price: dict[float, list[Order]] = defaultdict(list)
     for o in sells:
@@ -165,13 +151,10 @@ def _match_pro_rata(
         if buy_rem[buy.order_id] == 0:
             continue
 
-        # iterate sell price tiers from lowest to highest
         for sell_price in sorted(sells_by_price.keys()):
             if buy_rem[buy.order_id] == 0:
                 break
 
-            # Exclude sells from the SAME investor: an investor cannot trade with
-            # itself (self-matching a buy against its own sell is meaningless).
             tier = [
                 s for s in sells_by_price[sell_price]
                 if sell_rem[s.order_id] > 0 and s.investor_id != buy.investor_id
@@ -186,7 +169,6 @@ def _match_pro_rata(
             if fill == 0:
                 continue
 
-            # pro-rata: each seller gets floor(fill * their_share); remainder to earliest
             allocations: list[tuple[Order, int]] = []
             total_alloc = 0
             for seller in tier:

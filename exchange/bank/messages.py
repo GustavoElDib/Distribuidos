@@ -171,17 +171,27 @@ class BlockRejectedPayload:
     """Broadcast by the leader when its block is rejected by manager votes.
 
     Signals all nodes to advance the consensus round so leadership rotates
-    to the next bank for a fresh auction.
+    to the next bank for a fresh auction, and to discard the orders that
+    were part of the rejected block instead of retrying them.
     """
     block_index: int
     round: int
+    order_ids: list[str]
 
     def to_dict(self) -> dict:
-        return {"block_index": self.block_index, "round": self.round}
+        return {
+            "block_index": self.block_index,
+            "round": self.round,
+            "order_ids": self.order_ids,
+        }
 
     @classmethod
     def from_dict(cls, d: dict) -> "BlockRejectedPayload":
-        return cls(block_index=d["block_index"], round=d["round"])
+        return cls(
+            block_index=d["block_index"],
+            round=d["round"],
+            order_ids=d.get("order_ids", []),
+        )
 
 
 @dataclass

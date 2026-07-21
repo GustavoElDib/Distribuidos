@@ -1401,11 +1401,28 @@ async function loadPortfolio() {
   } catch(e) {}
 }
 
+
 async function loadMyOrders() {
   if (!investor) return;
   try {
-    const d = await (await fetch('/api/orders?limit=100')).json();
-    const mine = (d.orders || []).filter(o => (o.investor_id||'') === investor);
+    const [dbRes, pendRes] = await Promise.all([
+      fetch('/api/orders?limit=100'),
+      fetch('/api/pending-orders'),
+    ]);
+    const d = await dbRes.json();
+    const p = await pendRes.json();
+
+    // Ordens já resolvidas (matched/partial/expired/...), vindas do banco de dados
+    const settled = (d.orders || []).filter(o => (o.investor_id||'') === investor);
+
+
+    const settledIds = new Set(settled.map(o => o.order_id));
+    const waiting = (p.orders || [])
+      .filter(o => (o.investor_id||'') === investor && !settledIds.has(o.order_id))
+      .map(o => ({ ...o, status: 'pending', filled_quantity: 0 }));
+
+    const mine = [...waiting, ...settled];
+
     $('c-myorders').textContent = mine.filter(o => {
       const s = (o.status||'pending').toLowerCase();
       return !(s.includes('match')||s.includes('exec')||s.includes('expir')||s.includes('cancel')||s.includes('done')||s.includes('fill')||s.includes('partial'));

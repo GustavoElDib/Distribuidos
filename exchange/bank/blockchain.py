@@ -16,10 +16,10 @@ class Order:
     investor_id: str
     bank_id: str
     stock: str
-    side: str           # "buy" or "sell"
+    side: str          
     quantity: int
     limit_price: float
-    timestamp: str      # ISO8601 UTC
+    timestamp: str
 
     def to_dict(self) -> dict:
         return {
@@ -89,8 +89,8 @@ class Trade:
 
 @dataclass
 class EodSnapshot:
-    portfolios: dict[str, dict]     # investor_id -> {"cash": float, "shares": {stock: int}}
-    daily_ohlc: dict[str, dict]     # stock -> {"open", "high", "low", "close", "volume"}
+    portfolios: dict[str, dict] 
+    daily_ohlc: dict[str, dict]
 
     def to_dict(self) -> dict:
         return {"portfolios": self.portfolios, "daily_ohlc": self.daily_ohlc}
@@ -164,7 +164,7 @@ class BlockChain:
     def _init_genesis(self) -> None:
         genesis = Block(
             index=0,
-            timestamp="1970-01-01T00:00:00+00:00",  # fixed so all nodes produce identical hash
+            timestamp="1970-01-01T00:00:00+00:00",  # fixo para que todos os nós produzam hash idêntico
             previous_hash="0" * 64,
             producer_id="genesis",
             orders=[],
@@ -183,17 +183,17 @@ class BlockChain:
         last = self._chain[-1]
         if block.previous_hash != last.block_hash:
             raise ValueError(
-                f"block {block.index}: previous_hash mismatch "
-                f"(expected {last.block_hash}, got {block.previous_hash})"
+                f"bloco {block.index}: previous_hash não confere "
+                f"(esperado {last.block_hash}, recebido {block.previous_hash})"
             )
         if block.index != last.index + 1:
             raise ValueError(
-                f"block index gap: expected {last.index + 1}, got {block.index}"
+                f"lacuna no índice do bloco: esperado {last.index + 1}, recebido {block.index}"
             )
         expected_hash = self.compute_block_hash(block)
         if block.block_hash != expected_hash:
             raise ValueError(
-                f"block {block.index}: block_hash is invalid"
+                f"bloco {block.index}: block_hash inválido"
             )
         duplicated = [
             o.order_id for o in block.orders
@@ -201,12 +201,12 @@ class BlockChain:
         ]
         if duplicated:
             raise ValueError(
-                f"block {block.index}: {len(duplicated)} order(s) already "
-                f"committed in earlier blocks — duplicate trade rejected"
+                f"bloco {block.index}: {len(duplicated)} ordem(ns) já "
+                f"commitada(s) em blocos anteriores — negociação duplicada rejeitada"
             )
         self._chain.append(block)
         self._committed_order_ids.update(o.order_id for o in block.orders)
-        logger.info("appended block %d (producer=%s)", block.index, block.producer_id)
+        logger.info("bloco %d adicionado (produtor=%s)", block.index, block.producer_id)
 
     @property
     def committed_order_ids(self) -> set[str]:
@@ -227,7 +227,7 @@ class BlockChain:
         return len(self._chain)
 
     def compute_block_hash(self, block: Block) -> str:
-        # hash all fields except block_hash and signature
+        # aplica hash em todos os campos, exceto block_hash e signature
         payload = {
             "index": block.index,
             "timestamp": block.timestamp,
@@ -263,12 +263,12 @@ class BlockChain:
             block = self._chain[i]
             prev = self._chain[i - 1]
             if block.previous_hash != prev.block_hash:
-                logger.error("chain broken at index %d: previous_hash mismatch", i)
+                logger.error("cadeia quebrada no índice %d: previous_hash não confere", i)
                 return False
             if block.block_hash != self.compute_block_hash(block):
-                logger.error("chain broken at index %d: block_hash invalid", i)
+                logger.error("cadeia quebrada no índice %d: block_hash inválido", i)
                 return False
             if block.merkle_root != self.compute_merkle_root(block.trades):
-                logger.error("chain broken at index %d: merkle_root mismatch", i)
+                logger.error("cadeia quebrada no índice %d: merkle_root não confere", i)
                 return False
         return True

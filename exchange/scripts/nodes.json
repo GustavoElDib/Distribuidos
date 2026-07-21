@@ -2,7 +2,7 @@
   "nodes": [
     { "id": "bank_0", "host": "192.168.15.3", "port": 9000, "api_port": 8000 },
     { "id": "bank_1", "host": "192.168.15.3", "port": 9001, "api_port": 8001 },
-    { "id": "bank_2", "host": "192.168.87.28", "port": 9000, "api_port": 8002 },
-    { "id": "bank_3", "host": "192.168.87.28", "port": 9001, "api_port": 8003 }
+    { "id": "bank_2", "host": "192.168.56.1", "port": 9000, "api_port": 8002 },
+    { "id": "bank_3", "host": "192.168.56.1", "port": 9001, "api_port": 8003 }
   ]
 }

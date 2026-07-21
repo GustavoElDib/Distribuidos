@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-Run the exchange system locally — no Docker or PostgreSQL required.
-Uses SQLite databases stored in exchange/data/.
-
-Usage (from the exchange/ directory):
-    python scripts/run_local.py
-
-Flags:
-    --banks N   number of bank nodes to start (default: 4)
-    --clean     delete existing SQLite databases before starting
-"""
 from __future__ import annotations
 
 import argparse
@@ -92,6 +80,16 @@ def main() -> None:
     q = 2 * f + 1
     print(f"\nStarting {num_banks} bank nodes  |  BFT: f={f}, quorum={q}/{num_banks}\n")
 
+    # On Windows, Popen.terminate() calls TerminateProcess() — a hard kill that
+    # the child never sees as a signal, so its `finally: await node.stop()`
+    # never runs and the listening socket isn't closed before the process dies.
+    # Starting each child in its own process group lets us send CTRL_BREAK_EVENT
+    # instead, which Python does translate into a catchable KeyboardInterrupt/
+    # SIGBREAK, giving the child a chance to shut down cleanly.
+    popen_kwargs = {}
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
     procs: list[subprocess.Popen] = []
     for i in range(num_banks):
         env = bank_env(i, num_banks)
@@ -99,6 +97,7 @@ def main() -> None:
             [sys.executable, "-m", "bank"],
             cwd=str(ROOT),
             env=env,
+            **popen_kwargs,
         )
         procs.append(proc)
         print(f"  bank_{i}  TCP=:{BASE_PEER_PORT+i}  API=http://localhost:{BASE_API_PORT+i}")
@@ -108,12 +107,26 @@ def main() -> None:
     for i in range(num_banks):
         print(f"  http://localhost:{BASE_API_PORT+i}  (bank_{i})")
 
-    print("\nPress Ctrl+C to stop all nodes.\n")
+
+    GRACE_PERIOD_SECONDS = 10
 
     def _shutdown(sig, frame):
         print("\nShutting down...")
         for p in procs:
-            p.terminate()
+            if sys.platform == "win32":
+                p.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                p.terminate()
+
+        deadline = time.monotonic() + GRACE_PERIOD_SECONDS
+        for p in procs:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                p.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                print(f"  process {p.pid} did not stop in time, killing it")
+                p.kill()
+                p.wait()
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -121,7 +134,7 @@ def main() -> None:
     for proc in procs:
         proc.wait()
 
-    print("All bank nodes stopped.")
+    print("Todos os nós parados.")
 
 
 if __name__ == "__main__":
